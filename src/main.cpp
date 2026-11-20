@@ -2,10 +2,15 @@
 #include <TFT_eSPI.h>
 #include "CST820.h" // Include the touch controller header
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include "Config.h"
 #include "web_pages.h"
+
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
 
 // Define touch pins (from your notUsed/tftOutput.cpp)
 #define I2C_SDA 33
@@ -13,6 +18,9 @@
 #define TP_RST 25
 #define TP_INT 21
 #define GPIO_TEST_PIN 26
+#define MAX6675_SCK 18
+#define MAX6675_SO 19
+#define MAX6675_CS 23
 
 static WebServer server(80);
 static lv_obj_t *network_label;
@@ -51,10 +59,7 @@ static void handle_gpio_set()
     else if (pin_arg == "17") pin = 17;
     else if (pin_arg == "4") pin = 4;
     else if (pin_arg == "16") pin = 16;
-    else if (pin_arg == "18") pin = 18;
-    else if (pin_arg == "19") pin = 19;
     else if (pin_arg == "22") pin = 22;
-    else if (pin_arg == "23") pin = 23;
     else {
         server.send(400, "text/plain", "Ungueltiger GPIO");
         return;
@@ -134,7 +139,9 @@ static lv_obj_t *increase_button;
 static lv_obj_t *decrease_button;
 static lv_obj_t *start_button;
 static lv_obj_t *progress_bar;
-static float actual_temp = 215.4f;
+static float actual_temp;
+static bool actual_temp_read = false;
+static bool actual_temp_valid = false;
 static int target_temp = 220;
 static constexpr int MIN_TARGET_TEMP = 100;
 static constexpr int MAX_TARGET_TEMP = 250;
@@ -171,7 +178,9 @@ static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_
 
 static void update_temperature_labels()
 {
-    lv_label_set_text_fmt(actual_temp_label, "%.1f \xc2\xb0" "C", actual_temp);
+    if (!actual_temp_read) lv_label_set_text(actual_temp_label, "--.- \xc2\xb0" "C");
+    else if (!actual_temp_valid) lv_label_set_text(actual_temp_label, "Fehler");
+    else lv_label_set_text_fmt(actual_temp_label, "%.2f \xc2\xb0" "C", actual_temp);
     lv_label_set_text_fmt(target_temp_label, "%d \xc2\xb0" "C", target_temp);
 }
 
@@ -202,15 +211,25 @@ static void control_event_cb(lv_event_t *event)
     update_temperature_labels();
 }
 
-static void update_demo_temperature(lv_timer_t *timer)
+static void read_max6675(lv_timer_t *timer)
 {
     (void)timer;
-    if (!demo_running) return;
 
-    const float difference = target_temp - actual_temp;
-    if (difference > 0.3f) actual_temp += 0.3f;
-    else if (difference < -0.3f) actual_temp -= 0.3f;
-    else actual_temp = target_temp;
+    uint16_t reading = 0;
+    digitalWrite(MAX6675_CS, LOW);
+    delayMicroseconds(2);
+    for (uint8_t bit = 0; bit < 16; ++bit) {
+        digitalWrite(MAX6675_SCK, HIGH);
+        delayMicroseconds(1);
+        reading = (reading << 1) | digitalRead(MAX6675_SO);
+        digitalWrite(MAX6675_SCK, LOW);
+        delayMicroseconds(1);
+    }
+    digitalWrite(MAX6675_CS, HIGH);
+
+    actual_temp_read = true;
+    actual_temp_valid = (reading & 0x0004) == 0;
+    if (actual_temp_valid) actual_temp = (reading >> 3) * 0.25f;
     update_temperature_labels();
 }
 
@@ -402,6 +421,21 @@ static void start_setup_ap()
                                 WiFi.softAPIP().toString().c_str());
 }
 
+static void handle_ota()
+{
+    static bool started = false;
+    if (OTA_PASSWORD[0] == '\0' || WiFi.status() != WL_CONNECTED) return;
+
+    if (!started) {
+        ArduinoOTA.setHostname("reflowplate");
+        ArduinoOTA.setPassword(OTA_PASSWORD);
+        ArduinoOTA.begin();
+        started = true;
+        Serial.printf("OTA: reflowplate.local (%s)\n", WiFi.localIP().toString().c_str());
+    }
+    ArduinoOTA.handle();
+}
+
 void web_server_setup(){
     server.on("/", HTTP_GET, handle_main_page);
     server.on("/ui.css", HTTP_GET, []() { server.send_P(200, "text/css", UI_CSS); });
@@ -436,10 +470,15 @@ void setup() {
         digitalWrite(pin, HIGH);
         pinMode(pin, OUTPUT);
     }
-    for (uint8_t pin : {18, 19, 22, 23}) {
+    for (uint8_t pin : {22}) {
         digitalWrite(pin, HIGH);
         pinMode(pin, OUTPUT);
     }
+    pinMode(MAX6675_SCK, OUTPUT);
+    digitalWrite(MAX6675_SCK, LOW);
+    pinMode(MAX6675_SO, INPUT);
+    pinMode(MAX6675_CS, OUTPUT);
+    digitalWrite(MAX6675_CS, HIGH);
     settings_open = settings.begin("reflowplate");
     if (settings_open) {
         if (settings.getBytesLength("wifi") == sizeof(wifi_config)) settings.getBytes("wifi", &wifi_config, sizeof(wifi_config));
@@ -556,7 +595,7 @@ void setup() {
     status_label = create_label(screen, T_DISPLAY_READY, &lv_font_montserrat_12,
                                 lv_color_hex(0x7FE0A7), 196, 207);
     update_temperature_labels();
-    lv_timer_create(update_demo_temperature, 500, NULL);
+    lv_timer_create(read_max6675, 500, NULL);
     lv_timer_create(update_network_status, 1000, NULL);
 
     Serial.println("Setup done");
@@ -572,6 +611,7 @@ void loop() {
         wifi_started_at = millis();
         start_setup_ap();
     }
+    handle_ota();
     server.handleClient();
     lv_timer_handler();
     delay(5);

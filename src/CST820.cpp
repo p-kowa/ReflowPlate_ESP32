@@ -47,47 +47,25 @@ void CST820::begin(void)
 
 bool CST820::getTouch(uint16_t *x, uint16_t *y, uint8_t *gesture)
 {
-    bool FingerIndex = false;
-    FingerIndex = (bool)i2c_read(0x02);
-
-    // Read the gesture code from the chip. The previous logic was too
-    // restrictive and would block single taps from being registered.
-    *gesture = i2c_read(0x01);
+    uint8_t finger_count;
+    if (i2c_read_continuous(0x02, &finger_count, 1) != 0 || finger_count == 0) return false;
 
     uint8_t data[4];
-    i2c_read_continuous(0x03,data,4);
+    if (i2c_read_continuous(0x01, gesture, 1) != 0 ||
+        i2c_read_continuous(0x03, data, sizeof(data)) != 0) return false;
+
     *x = ((data[0] & 0x0f) << 8) | data[1];
     *y = ((data[2] & 0x0f) << 8) | data[3];
-
-
-    return FingerIndex;
-}
-
-uint8_t CST820::i2c_read(uint8_t addr)
-{
-    uint8_t rdData;
-    uint8_t rdDataCount;
-    do
-    {
-        Wire.beginTransmission(I2C_ADDR_CST820);
-        Wire.write(addr);
-        Wire.endTransmission(false); // Restart
-        rdDataCount = Wire.requestFrom(I2C_ADDR_CST820, 1);
-    } while (rdDataCount == 0);
-    while (Wire.available())
-    {
-        rdData = Wire.read();
-    }
-    return rdData;
+    return true;
 }
 
 uint8_t CST820::i2c_read_continuous(uint8_t addr, uint8_t *data, uint32_t length)
 {
   Wire.beginTransmission(I2C_ADDR_CST820);
   Wire.write(addr);
-  if ( Wire.endTransmission(true))return -1;
-  Wire.requestFrom(I2C_ADDR_CST820, length);
-  for (int i = 0; i < length; i++) {
+    if (Wire.endTransmission(true) != 0) return -1;
+    if (Wire.requestFrom(I2C_ADDR_CST820, length) != length) return -1;
+    for (uint32_t index = 0; index < length; ++index) {
     *data++ = Wire.read();
   }
   return 0;
