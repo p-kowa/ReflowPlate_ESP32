@@ -3,6 +3,10 @@
 #include "CST820.h" // Include the touch controller header
 #include <WiFi.h>
 #include <ArduinoOTA.h>
+#include <Update.h>
+#include <driver/gpio.h>
+#include <esp_timer.h>
+#include <math.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include "Config.h"
@@ -17,7 +21,7 @@
 #define I2C_SCL 32
 #define TP_RST 25
 #define TP_INT 21
-#define GPIO_TEST_PIN 26
+static constexpr gpio_num_t HEATER_PIN = GPIO_NUM_26;
 #define MAX6675_SCK 18
 #define MAX6675_SO 19
 #define MAX6675_CS 23
@@ -55,8 +59,7 @@ static void handle_gpio_set()
     const String pin_arg = server.arg("pin");
     const String value = server.arg("value");
     uint8_t pin;
-    if (pin_arg == "26") pin = GPIO_TEST_PIN;
-    else if (pin_arg == "17") pin = 17;
+    if (pin_arg == "17") pin = 17;
     else if (pin_arg == "4") pin = 4;
     else if (pin_arg == "16") pin = 16;
     else if (pin_arg == "22") pin = 22;
@@ -138,18 +141,50 @@ static lv_obj_t *status_label;
 static lv_obj_t *increase_button;
 static lv_obj_t *decrease_button;
 static lv_obj_t *start_button;
-static lv_obj_t *progress_bar;
 static float actual_temp;
 static bool actual_temp_read = false;
 static bool actual_temp_valid = false;
+static uint32_t last_sample_at;
 static int target_temp = 220;
-static constexpr int MIN_TARGET_TEMP = 100;
+static int draft_temp = 220;
 static constexpr int MAX_TARGET_TEMP = 250;
 static constexpr int TARGET_TEMP_STEP = 5;
-static int profile_progress = 87;
-static bool demo_running = false;
-static uint32_t demo_started_at = 0;
-static uint32_t demo_elapsed = 0;
+static constexpr uint32_t SAMPLE_TIMEOUT_MS = 1500;
+static constexpr uint32_t MAX_HEAT_TIME_MS = 15 * 60 * 1000;
+static constexpr float HEATER_HYSTERESIS = 2.0f;
+static constexpr float MAX_PLATE_TEMP = 260.0f;
+static bool regulation_running = false;
+static uint32_t regulation_started_at;
+static uint32_t regulation_elapsed;
+static bool heater_on = false;
+static uint32_t heater_off_at;
+static esp_timer_handle_t heater_watchdog;
+static bool heater_watchdog_ready = false;
+static portMUX_TYPE heater_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t heater_deadline_us;
+static bool heater_expired = false;
+
+static void check_heater_deadline(void *)
+{
+    portENTER_CRITICAL(&heater_lock);
+    if (heater_deadline_us != 0 && esp_timer_get_time() >= heater_deadline_us) {
+        gpio_set_level(HEATER_PIN, HIGH);
+        heater_deadline_us = 0;
+        heater_expired = true;
+    }
+    portEXIT_CRITICAL(&heater_lock);
+}
+
+static bool sample_is_fresh()
+{
+    return actual_temp_valid && millis() - last_sample_at < SAMPLE_TIMEOUT_MS;
+}
+
+static int minimum_target_temp()
+{
+    if (!sample_is_fresh()) return MAX_TARGET_TEMP + TARGET_TEMP_STEP;
+    return static_cast<int>(ceilf(actual_temp / TARGET_TEMP_STEP)) * TARGET_TEMP_STEP;
+}
 
 static lv_obj_t *create_panel(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                               lv_coord_t width, lv_coord_t height, lv_color_t color)
@@ -181,23 +216,84 @@ static void update_temperature_labels()
     if (!actual_temp_read) lv_label_set_text(actual_temp_label, "--.- \xc2\xb0" "C");
     else if (!actual_temp_valid) lv_label_set_text(actual_temp_label, "Fehler");
     else lv_label_set_text_fmt(actual_temp_label, "%.2f \xc2\xb0" "C", actual_temp);
-    lv_label_set_text_fmt(target_temp_label, "%d \xc2\xb0" "C", target_temp);
+    lv_label_set_text_fmt(target_temp_label, "%d \xc2\xb0" "C", draft_temp);
+    if (regulation_running || draft_temp >= minimum_target_temp()) {
+        lv_obj_clear_state(start_button, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(start_button, LV_STATE_DISABLED);
+    }
 }
 
-static void set_demo_running(bool running)
+static void stop_regulation()
 {
-    if (running == demo_running) return;
-    if (running) {
-        demo_started_at = millis();
-        demo_elapsed = 0;
-    } else {
-        demo_elapsed = millis() - demo_started_at;
+    portENTER_CRITICAL(&heater_lock);
+    gpio_set_level(HEATER_PIN, HIGH);
+    heater_deadline_us = 0;
+    portEXIT_CRITICAL(&heater_lock);
+    if (heater_on) heater_off_at = millis();
+    heater_on = false;
+    if (!regulation_running) return;
+    regulation_elapsed = millis() - regulation_started_at;
+    regulation_running = false;
+    lv_label_set_text(status_label, T_DISPLAY_READY);
+    lv_label_set_text(lv_obj_get_child(start_button, 0), T_DISPLAY_SET);
+    lv_obj_set_style_bg_color(start_button, lv_color_hex(0x168B58), 0);
+}
+
+static bool temperature_is_safe(int requested)
+{
+    return sample_is_fresh() && actual_temp < MAX_PLATE_TEMP && actual_temp < requested + 15.0f;
+}
+
+static void regulate_heater()
+{
+    if (!regulation_running) return;
+    const uint32_t now = millis();
+    if (!temperature_is_safe(target_temp) || now - regulation_started_at >= MAX_HEAT_TIME_MS) {
+        stop_regulation();
+        return;
     }
-    demo_running = running;
-    lv_label_set_text(status_label, running ? T_DISPLAY_HEATING : T_DISPLAY_READY);
-    lv_label_set_text(lv_obj_get_child(start_button, 0), running ? T_PLATE_STOP : T_DISPLAY_SET);
-    lv_obj_set_style_bg_color(start_button,
-                              running ? lv_color_hex(0x9E3D36) : lv_color_hex(0x168B58), 0);
+
+    const bool enable = heater_on ? actual_temp < target_temp :
+                        actual_temp <= target_temp - HEATER_HYSTERESIS && now - heater_off_at >= 5000;
+    const int64_t now_us = esp_timer_get_time();
+    const uint32_t sample_remaining = SAMPLE_TIMEOUT_MS - (now - last_sample_at);
+    const uint32_t session_remaining = MAX_HEAT_TIME_MS - (now - regulation_started_at);
+    const uint32_t remaining = sample_remaining < session_remaining ? sample_remaining : session_remaining;
+    portENTER_CRITICAL(&heater_lock);
+    const bool expired = heater_expired || (heater_deadline_us != 0 && now_us >= heater_deadline_us);
+    if (!expired) {
+        heater_deadline_us = now_us + static_cast<int64_t>(remaining) * 1000;
+        gpio_set_level(HEATER_PIN, enable ? LOW : HIGH);
+    }
+    portEXIT_CRITICAL(&heater_lock);
+    if (expired) {
+        stop_regulation();
+        return;
+    }
+    if (heater_on && !enable) heater_off_at = now;
+    heater_on = enable;
+    lv_label_set_text(status_label, enable ? T_DISPLAY_HEATING : T_DISPLAY_READY);
+}
+
+static bool start_regulation(int requested)
+{
+    if (!heater_watchdog_ready || restart_pending || requested < minimum_target_temp() ||
+        requested > MAX_TARGET_TEMP || !temperature_is_safe(requested)) return false;
+    if (!regulation_running) {
+        portENTER_CRITICAL(&heater_lock);
+        heater_expired = false;
+        portEXIT_CRITICAL(&heater_lock);
+        regulation_started_at = millis();
+        regulation_elapsed = 0;
+        regulation_running = true;
+    }
+    target_temp = requested;
+    draft_temp = requested;
+    lv_label_set_text(lv_obj_get_child(start_button, 0), T_PLATE_STOP);
+    lv_obj_set_style_bg_color(start_button, lv_color_hex(0x9E3D36), 0);
+    regulate_heater();
+    return regulation_running;
 }
 
 static void control_event_cb(lv_event_t *event)
@@ -205,9 +301,17 @@ static void control_event_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
 
     lv_obj_t *button = lv_event_get_target(event);
-    if (button == increase_button && target_temp < MAX_TARGET_TEMP) target_temp += TARGET_TEMP_STEP;
-    if (button == decrease_button && target_temp > MIN_TARGET_TEMP) target_temp -= TARGET_TEMP_STEP;
-    if (button == start_button) set_demo_running(!demo_running);
+    const int minimum = minimum_target_temp();
+    if (!regulation_running && minimum <= MAX_TARGET_TEMP) {
+        if (button == increase_button && draft_temp < MAX_TARGET_TEMP) {
+            draft_temp = draft_temp < minimum ? minimum : draft_temp + TARGET_TEMP_STEP;
+        }
+        if (button == decrease_button && draft_temp > minimum) draft_temp -= TARGET_TEMP_STEP;
+    }
+    if (button == start_button) {
+        if (regulation_running) stop_regulation();
+        else start_regulation(draft_temp);
+    }
     update_temperature_labels();
 }
 
@@ -228,8 +332,13 @@ static void read_max6675(lv_timer_t *timer)
     digitalWrite(MAX6675_CS, HIGH);
 
     actual_temp_read = true;
-    actual_temp_valid = (reading & 0x0004) == 0;
-    if (actual_temp_valid) actual_temp = (reading >> 3) * 0.25f;
+    const uint16_t temperature_bits = (reading >> 3) & 0x0fff;
+    actual_temp_valid = (reading & 0x8006) == 0 && temperature_bits != 0;
+    if (actual_temp_valid) {
+        actual_temp = temperature_bits * 0.25f;
+        last_sample_at = millis();
+    }
+    regulate_heater();
     update_temperature_labels();
 }
 
@@ -258,32 +367,51 @@ void handleSetup() {
 }
 
 void handle_main_page() {
+    if (OTA_PASSWORD[0] != '\0' && !server.authenticate("ota", OTA_PASSWORD)) {
+        server.requestAuthentication(BASIC_AUTH, "ReflowPlate");
+        return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html", INDEX_HTML);
 }
 
 static void handle_plate_status()
 {
-    const uint32_t elapsed = demo_running ? millis() - demo_started_at : demo_elapsed;
-    char json[192];
+    const uint32_t elapsed = regulation_running ? millis() - regulation_started_at : regulation_elapsed;
+    char actual[16] = "null";
+    if (sample_is_fresh()) snprintf(actual, sizeof(actual), "%.2f", actual_temp);
+    char json[224];
     snprintf(json, sizeof(json),
-             "{\"actual\":%.1f,\"target\":%d,\"running\":%s,\"elapsed\":%lu,\"min\":%d,\"max\":%d,\"step\":%d}",
-             actual_temp, target_temp, demo_running ? "true" : "false",
-             static_cast<unsigned long>(elapsed / 1000), MIN_TARGET_TEMP, MAX_TARGET_TEMP, TARGET_TEMP_STEP);
+             "{\"actual\":%s,\"target\":%d,\"running\":%s,\"canSet\":%s,\"elapsed\":%lu,\"min\":%d,\"max\":%d,\"step\":%d}",
+             actual, target_temp, regulation_running ? "true" : "false",
+             OTA_PASSWORD[0] != '\0' && WiFi.status() == WL_CONNECTED && heater_watchdog_ready &&
+             !restart_pending && minimum_target_temp() <= MAX_TARGET_TEMP ? "true" : "false",
+             static_cast<unsigned long>(elapsed / 1000), minimum_target_temp(), MAX_TARGET_TEMP, TARGET_TEMP_STEP);
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", json);
 }
 
 static void handle_plate_set()
 {
+    if (OTA_PASSWORD[0] == '\0' || WiFi.status() != WL_CONNECTED || server.header("X-Reflow-Control") != "1") {
+        server.send(403);
+        return;
+    }
+    if (!server.authenticate("ota", OTA_PASSWORD)) {
+        server.requestAuthentication(BASIC_AUTH, "ReflowPlate");
+        return;
+    }
     const String requested = server.arg("target");
     const long temperature = requested.toInt();
-    if (temperature < MIN_TARGET_TEMP || temperature > MAX_TARGET_TEMP ||
-        (temperature - MIN_TARGET_TEMP) % TARGET_TEMP_STEP != 0 || requested != String(temperature)) {
+    if (temperature <= 0 || temperature > MAX_TARGET_TEMP ||
+        temperature % TARGET_TEMP_STEP != 0 || requested != String(temperature)) {
         server.send(400);
         return;
     }
-    target_temp = temperature;
-    set_demo_running(true);
+    if (!start_regulation(temperature)) {
+        server.send(409);
+        return;
+    }
     update_temperature_labels();
     handle_plate_status();
 }
@@ -344,6 +472,7 @@ static void handle_wifi_scan()
 
 static void store_wifi(const WifiSettings &updated)
 {
+    stop_regulation();
     if (!settings_open || settings.putBytes("wifi", &updated, sizeof(updated)) != sizeof(updated)) {
         server.send(500);
         return;
@@ -429,6 +558,7 @@ static void handle_ota()
     if (!started) {
         ArduinoOTA.setHostname("reflowplate");
         ArduinoOTA.setPassword(OTA_PASSWORD);
+        ArduinoOTA.onStart(stop_regulation);
         ArduinoOTA.begin();
         started = true;
         Serial.printf("OTA: reflowplate.local (%s)\n", WiFi.localIP().toString().c_str());
@@ -436,13 +566,100 @@ static void handle_ota()
     ArduinoOTA.handle();
 }
 
+static bool web_update_writing = false;
+static bool web_update_received = false;
+static const char *web_update_error = nullptr;
+
+static bool web_update_authorized()
+{
+    return OTA_PASSWORD[0] != '\0' && WiFi.status() == WL_CONNECTED &&
+           server.authenticate("ota", OTA_PASSWORD);
+}
+
+static bool web_update_binary_request()
+{
+    return server.header("X-Firmware-Upload") == "1" &&
+           server.header("Content-Type") == "application/octet-stream";
+}
+
+static void handle_web_update_data()
+{
+    if (!web_update_binary_request()) return;
+    const HTTPRaw &chunk = server.raw();
+    switch (chunk.status) {
+    case RAW_START:
+        web_update_received = false;
+        web_update_error = nullptr;
+        if (!web_update_authorized() || restart_pending) return;
+        stop_regulation();
+        if (server.clientContentLength() <= 0) {
+            web_update_error = "Firmware fehlt.";
+        } else if (Update.begin(static_cast<size_t>(server.clientContentLength()), U_FLASH)) {
+            web_update_writing = true;
+        } else {
+            web_update_error = Update.errorString();
+        }
+        break;
+    case RAW_WRITE:
+        if (web_update_writing && Update.write(server.raw().buf, chunk.currentSize) != chunk.currentSize) {
+            web_update_error = Update.errorString();
+            if (Update.isRunning()) Update.abort();
+            web_update_writing = false;
+        }
+        break;
+    case RAW_END:
+        web_update_received = web_update_writing;
+        break;
+    case RAW_ABORTED:
+        if (web_update_writing) Update.abort();
+        web_update_writing = false;
+        web_update_received = false;
+        break;
+    }
+}
+
+static void handle_web_update()
+{
+    server.sendHeader("Cache-Control", "no-store");
+    if (OTA_PASSWORD[0] == '\0' || WiFi.status() != WL_CONNECTED) {
+        server.send(404, "text/plain", "OTA nicht verfuegbar.");
+    } else if (!web_update_authorized()) {
+        server.requestAuthentication(BASIC_AUTH, "ReflowPlate OTA", "Anmeldung erforderlich.");
+    } else if (server.method() == HTTP_GET) {
+        server.send_P(200, "text/html; charset=utf-8", OTA_PAGE);
+    } else if (restart_pending) {
+        server.send(409, "text/plain", "Neustart steht bereits aus.");
+    } else if (!web_update_binary_request()) {
+        server.send(415, "text/plain", "Firmware-Upload erwartet.");
+    } else if (web_update_received && Update.end()) {
+        server.send(200, "text/plain", "Update erfolgreich. Das Geraet startet neu.");
+        restart_at = millis();
+        restart_pending = true;
+    } else {
+        const char *message = web_update_error ? web_update_error :
+                              (web_update_received ? Update.errorString() : "Firmware fehlt oder ist unvollstaendig.");
+        server.send(400, "text/plain", message);
+    }
+
+    if (server.method() == HTTP_POST) {
+        if (web_update_writing && Update.isRunning()) Update.abort();
+        web_update_writing = false;
+        web_update_received = false;
+        web_update_error = nullptr;
+    }
+}
+
 void web_server_setup(){
+    const char *update_headers[] = {"Content-Type", "X-Firmware-Upload", "X-Reflow-Control"};
+    server.collectHeaders(update_headers, sizeof(update_headers) / sizeof(update_headers[0]));
+    server.on("/update", HTTP_GET, handle_web_update);
+    server.on("/update", HTTP_POST, handle_web_update, handle_web_update_data);
     server.on("/", HTTP_GET, handle_main_page);
     server.on("/ui.css", HTTP_GET, []() { server.send_P(200, "text/css", UI_CSS); });
     server.on("/api/plate", HTTP_GET, handle_plate_status);
     server.on("/api/plate", HTTP_POST, handle_plate_set);
     server.on("/api/plate/stop", HTTP_POST, []() {
-        set_demo_running(false);
+        stop_regulation();
         handle_plate_status();
     });
     server.on("/gpio", HTTP_POST, handle_gpio_set);
@@ -462,10 +679,16 @@ void web_server_setup(){
 }
 
 void setup() {
+    gpio_set_level(HEATER_PIN, HIGH);
+    pinMode(HEATER_PIN, OUTPUT);
+    gpio_set_level(HEATER_PIN, HIGH);
+    esp_timer_create_args_t watchdog_args = {};
+    watchdog_args.callback = check_heater_deadline;
+    watchdog_args.name = "heater_guard";
+    heater_watchdog_ready = esp_timer_create(&watchdog_args, &heater_watchdog) == ESP_OK &&
+                            esp_timer_start_periodic(heater_watchdog, 100000) == ESP_OK;
     Serial.begin(115200);
 
-    digitalWrite(GPIO_TEST_PIN, HIGH);
-    pinMode(GPIO_TEST_PIN, OUTPUT);
     for (uint8_t pin : {17, 4, 16}) {
         digitalWrite(pin, HIGH);
         pinMode(pin, OUTPUT);
@@ -476,7 +699,7 @@ void setup() {
     }
     pinMode(MAX6675_SCK, OUTPUT);
     digitalWrite(MAX6675_SCK, LOW);
-    pinMode(MAX6675_SO, INPUT);
+    pinMode(MAX6675_SO, INPUT_PULLUP);
     pinMode(MAX6675_CS, OUTPUT);
     digitalWrite(MAX6675_CS, HIGH);
     settings_open = settings.begin("reflowplate");
@@ -547,10 +770,6 @@ void setup() {
                                  lv_color_hex(0xDDE7EE), 8, 5);
     lv_obj_set_width(network_label, 220);
     lv_obj_set_style_text_align(network_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_t *demo_badge = create_panel(screen, 237, 3, 75, 21, lv_color_hex(0x633C27));
-    lv_obj_set_style_radius(demo_badge, 6, 0);
-    create_label(demo_badge, "DEMO", &lv_font_montserrat_12,
-                 lv_color_hex(0xFFC16D), 16, 3);
 
     lv_obj_t *actual_panel = create_panel(screen, 8, 28, 180, 82, lv_color_hex(0x1B2B3D));
     create_label(actual_panel, T_DISPLAY_ACTUAL, &lv_font_montserrat_14,
@@ -579,19 +798,6 @@ void setup() {
     start_button = create_action_button(screen, 196, 158, 42, T_DISPLAY_SET, &lv_font_montserrat_24,
                                         lv_color_hex(0x168B58));
 
-    progress_bar = lv_bar_create(screen);
-    lv_obj_set_pos(progress_bar, 8, 198);
-    lv_obj_set_size(progress_bar, 180, 9);
-    lv_bar_set_range(progress_bar, 0, 100);
-    lv_bar_set_value(progress_bar, profile_progress, LV_ANIM_OFF);
-    lv_obj_set_style_radius(progress_bar, 5, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(progress_bar, lv_color_hex(0x263645), LV_PART_MAIN);
-    lv_obj_set_style_radius(progress_bar, 5, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(progress_bar, lv_color_hex(0x36B9D5), LV_PART_INDICATOR);
-
-    lv_obj_t *profile_label = create_label(screen, "", &lv_font_montserrat_12,
-                                           lv_color_hex(0xB9CAD8), 8, 211);
-    lv_label_set_text_fmt(profile_label, T_DISPLAY_PROFILE, profile_progress);
     status_label = create_label(screen, T_DISPLAY_READY, &lv_font_montserrat_12,
                                 lv_color_hex(0x7FE0A7), 196, 207);
     update_temperature_labels();
@@ -606,8 +812,12 @@ void setup() {
 }
 
 void loop() {
-    if (restart_pending && millis() - restart_at >= 1000) ESP.restart();
+    if (restart_pending && millis() - restart_at >= 1000) {
+        stop_regulation();
+        ESP.restart();
+    }
     if (!setup_ap && WiFi.status() != WL_CONNECTED && millis() - wifi_started_at >= 20000) {
+        stop_regulation();
         wifi_started_at = millis();
         start_setup_ap();
     }

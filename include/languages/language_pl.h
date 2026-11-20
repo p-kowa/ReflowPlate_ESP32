@@ -19,8 +19,8 @@
 #define T_DISPLAY_TARGET "CEL"
 #define T_DISPLAY_ACTUAL_DETAIL "Temperatura aktualna"
 #define T_DISPLAY_SET "USTAW"
-#define T_DISPLAY_READY "DEMO: GOTOWE"
-#define T_DISPLAY_HEATING "DEMO: GRZANIE"
+#define T_DISPLAY_READY "GOTOWE"
+#define T_DISPLAY_HEATING "GRZANIE"
 #define T_DISPLAY_PROFILE "Profil %d%%"
 #define T_DISPLAY_WIFI_CONNECTING "Laczenie z Wi-Fi..."
 

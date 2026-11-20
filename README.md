@@ -4,11 +4,11 @@ PlatformIO project for an ESP32-based reflow plate with an LVGL touchscreen and 
 
 ## Project Status
 
-The current firmware is a UI and networking prototype. Temperature, target temperature, and profile progress are simulated; real temperature sensing and heater control are not implemented. Do not use the interface to control a real heating plate.
+The firmware reads the plate temperature with a MAX6675 and supports fixed-setpoint heating. Reflow profiles and real-load commissioning are not complete.
 
 ## Features
 
-- LVGL touchscreen interface with temperature display and a demo heating cycle
+- LVGL touchscreen interface with temperature display and fixed-setpoint heating
 - Wi-Fi connection and setup access point when no Wi-Fi credentials are configured
 - Web interface and HTTP endpoints for status, Wi-Fi, and MQTT configuration
 - German, English, and Polish interface languages
@@ -23,6 +23,13 @@ The current firmware is a UI and networking prototype. Temperature, target tempe
 - LVGL and TFT_eSPI are included in `lib/`; PlatformIO resolves other required libraries.
 
 The touch and display pins and the display configuration must match your hardware. TFT_eSPI settings are in `lib/TFT_eSPI/User_Setup.h`.
+
+## Heater commissioning
+
+- GPIO26 drives an active-low actuator input: `HIGH` is off, `LOW` is on. The external driver must hold the heater off while the ESP32 is unpowered or resetting; the plate also needs an independent thermal cutoff.
+- **Set** starts regulation at the selected temperature. The output turns off at the target, restarts 2 C below it with at least 5 seconds off between activations, and stops after 15 minutes. A missing/stale reading or overtemperature ends the session; it does not resume automatically.
+- Web control uses username `ota` and the configured OTA password. Web start is unavailable without an OTA password. Use only a trusted local network.
+- Before connecting heater power, verify the actuator input stays off at power-on and reset, and returns to off on **Stop**, sensor disconnection and OTA. The 260 C firmware cutoff and the cutoff at 15 C above the target are not substitutes for independent protection.
 
 ## Build
 
@@ -43,6 +50,14 @@ Default SSID and password values are in `include/Config.h`. Enter your own crede
 Wi-Fi and MQTT settings can also be saved through the web interface.
 
 ## Wi-Fi Firmware Updates (OTA)
+
+### Browser upload (no incoming PC connection)
+
+1. Set `OTA_PASSWORD` in local `include/Config.h` and install this firmware once via USB-TTL using `esp32_ReflowPlate_Dev_DE` (or via ArduinoOTA from a machine that permits the TCP callback). Keep the heater disconnected.
+2. Once the device joins Wi-Fi, open `http://<device-ip>/update`. Sign in as `ota` with the password configured on the device. Use only a trusted local network: HTTP does not encrypt the password or firmware.
+3. Select an existing PlatformIO `firmware.bin` from `.pio/build/<environment>/` and click **Aktualisieren**. Do not select `bootloader.bin` or `partitions.bin`. A successful upload is followed by an automatic reboot. The page uploads an existing file; it does not start a build.
+
+### PlatformIO upload (ArduinoOTA)
 
 1. In your local `include/Config.h`, add `#define OTA_PASSWORD "your-own-long-random-password"` with a unique password. An empty password disables OTA. Use OTA only on a trusted local network.
 2. With the heater disconnected, upload **once over USB-TTL** using `esp32_ReflowPlate_Dev_DE`. This installs the new `min_spiffs.csv` partition table with two 1,920 KiB firmware slots; OTA cannot migrate the old `huge_app.csv` layout. A normal serial upload preserves NVS; do not erase the flash.

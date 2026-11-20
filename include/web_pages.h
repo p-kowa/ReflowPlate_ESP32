@@ -2,6 +2,34 @@
 #include <Arduino.h>
 #include "language.h"
 
+static const char OTA_PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firmware-Update</title>
+<h1>Firmware-Update</h1>
+<form id="update"><label>Firmware <input id="firmware" type="file" accept=".bin" required></label>
+<button type="submit">Aktualisieren</button></form>
+<p id="status" role="status"></p>
+<script>
+const form = document.getElementById('update');
+const statusText = document.getElementById('status');
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const file = document.getElementById('firmware').files[0];
+  const button = form.querySelector('button');
+  button.disabled = true;
+  statusText.textContent = 'Update wird geschrieben ...';
+  try {
+    const response = await fetch('/update', {method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/octet-stream', 'X-Firmware-Upload': '1'}, body: file});
+    statusText.textContent = await response.text();
+    if (response.ok) return;
+  } catch (error) {
+    statusText.textContent = 'Verbindung unterbrochen. Bitte Geraet und Firmwarestand pruefen.';
+  }
+  button.disabled = false;
+});
+</script></html>)HTML";
+
 // ==========================================
 // 1. Reflow Plate(main page)
 // ==========================================
@@ -18,7 +46,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <main class="container">
     <section class="card">
       <h1>Reflow Plate</h1>
-      <p class="subtitle">)rawliteral" T_PLATE_DEMO R"rawliteral(</p>
       <dl class="readings">
         <div><dt>)rawliteral" T_PLATE_ACTUAL R"rawliteral(</dt><dd id="actual">--</dd></div>
         <div><dt>)rawliteral" T_PLATE_TARGET R"rawliteral(</dt><dd id="target">--</dd></div>
@@ -44,19 +71,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     let state, draft, edited = false, busy = false, polling = false, revision = 0;
 
     function render() {
-      ui.actual.textContent = degrees(state.actual);
+      ui.actual.textContent = state.actual === null ? '--' : degrees(state.actual);
       ui.target.textContent = degrees(state.target);
       ui.draft.textContent = degrees(draft);
       ui.elapsed.textContent = [Math.floor(state.elapsed / 3600), Math.floor(state.elapsed / 60) % 60, state.elapsed % 60]
         .map(value => String(value).padStart(2, '0')).join(':');
       ui.minus.disabled = busy || draft <= state.min;
-      ui.plus.disabled = busy || draft >= state.max;
-      ui.apply.disabled = busy;
+      ui.plus.disabled = busy || state.min > state.max || draft >= state.max;
+      ui.apply.disabled = busy || !state.canSet || draft < state.min;
       ui.stop.disabled = busy || !state.running;
     }
 
     function adjust(direction) {
-      draft += direction * state.step;
+      draft = Math.max(state.min, draft + direction * state.step);
       edited = true;
       render();
     }
@@ -91,7 +118,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     ui.minus.onclick = () => adjust(-1);
     ui.plus.onclick = () => adjust(1);
-    ui.apply.onclick = () => request('/api/plate', {method: 'POST', body: new URLSearchParams({target: draft})});
+    ui.apply.onclick = () => request('/api/plate', {method: 'POST',
+      headers: {'X-Reflow-Control': '1'}, body: new URLSearchParams({target: draft})});
     ui.stop.onclick = () => request('/api/plate/stop', {method: 'POST'});
     request('/api/plate');
     setInterval(() => request('/api/plate'), 1000);
