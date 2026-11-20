@@ -28,10 +28,13 @@ static constexpr gpio_num_t HEATER_PIN = GPIO_NUM_26;
 
 static WebServer server(80);
 static lv_obj_t *network_label;
+static lv_obj_t *setup_ap_label;
 static String current_network_status;
 static Preferences settings;
 static bool settings_open = false;
 static bool setup_ap = false;
+static char setup_ap_name[sizeof("Reflow999")];
+static char setup_ap_password[9];
 static bool scanning_wifi = false;
 static bool restart_pending = false;
 static uint32_t restart_at;
@@ -82,14 +85,22 @@ static void handle_gpio_set()
 static void update_network_status(lv_timer_t *timer)
 {
     (void)timer;
+    const bool connected = WiFi.status() == WL_CONNECTED;
     String status;
-    if (WiFi.status() == WL_CONNECTED) status = WiFi.localIP().toString();
-    else if (setup_ap) status = "AP: " + WiFi.softAPIP().toString();
+    if (connected) status = WiFi.localIP().toString();
+    else if (setup_ap) status = "AP: " + String(setup_ap_name);
     else status = T_DISPLAY_WIFI_CONNECTING;
 
     if (status != current_network_status) {
         current_network_status = status;
         lv_label_set_text(network_label, current_network_status.c_str());
+        if (setup_ap && !connected) {
+            lv_label_set_text_fmt(setup_ap_label, "PW: %s\n%s/setup",
+                                  setup_ap_password, WiFi.softAPIP().toString().c_str());
+            lv_obj_clear_flag(setup_ap_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(setup_ap_label, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -539,14 +550,22 @@ static void handle_mqtt_save()
 
 static void start_setup_ap()
 {
-    char name[24];
-    char password[17];
-    snprintf(name, sizeof(name), "ReflowPlate-%06lX", static_cast<unsigned long>(ESP.getEfuseMac() & 0xFFFFFF));
-    snprintf(password, sizeof(password), "%08lX%08lX", static_cast<unsigned long>(esp_random()),
-             static_cast<unsigned long>(esp_random()));
     WiFi.mode(WIFI_AP_STA);
-    setup_ap = WiFi.softAP(name, password);
-    if (setup_ap) Serial.printf("Setup AP: %s / %s / http://%s/setup\n", name, password,
+    snprintf(setup_ap_name, sizeof(setup_ap_name), "Reflow%u",
+             static_cast<unsigned>(esp_random() % 999 + 1));
+    static constexpr char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    static constexpr unsigned alphabet_size = sizeof(alphabet) - 1;
+    static constexpr unsigned sample_limit = (256 / alphabet_size) * alphabet_size;
+    for (size_t index = 0; index < sizeof(setup_ap_password) - 1; ++index) {
+        unsigned sample;
+        do {
+            sample = esp_random() & 0xff;
+        } while (sample >= sample_limit);
+        setup_ap_password[index] = alphabet[sample % alphabet_size];
+    }
+    setup_ap_password[sizeof(setup_ap_password) - 1] = '\0';
+    setup_ap = WiFi.softAP(setup_ap_name, setup_ap_password);
+    if (setup_ap) Serial.printf("Setup AP: %s / %s / http://%s/setup\n", setup_ap_name, setup_ap_password,
                                 WiFi.softAPIP().toString().c_str());
 }
 
@@ -800,6 +819,11 @@ void setup() {
 
     status_label = create_label(screen, T_DISPLAY_READY, &lv_font_montserrat_12,
                                 lv_color_hex(0x7FE0A7), 196, 207);
+    setup_ap_label = create_label(screen, "", &lv_font_montserrat_12, lv_color_hex(0xDDE7EE), 8, 193);
+    lv_obj_set_width(setup_ap_label, 180);
+    lv_obj_set_style_text_line_space(setup_ap_label, 0, 0);
+    lv_obj_add_flag(setup_ap_label, LV_OBJ_FLAG_HIDDEN);
+    update_network_status(NULL);
     update_temperature_labels();
     lv_timer_create(read_max6675, 500, NULL);
     lv_timer_create(update_network_status, 1000, NULL);

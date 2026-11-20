@@ -45,7 +45,7 @@ Build the project with **PlatformIO: Build**, then upload it to the ESP32.
 
 ## Wi-Fi Setup
 
-Default SSID and password values are in `include/Config.h`. Enter your own credentials before flashing, and do not commit real credentials to a public repository. If no SSID is configured, the firmware starts a setup access point. Its network name, temporary password, and setup URL are printed to the serial console.
+Default SSID and password values are in `include/Config.h`. Enter your own credentials before flashing, and do not commit real credentials to a public repository. If no SSID is configured, the firmware starts a setup access point. Its network name, temporary password, and setup URL appear on the device display and in the serial console. Join the displayed network and open the setup URL to configure Wi-Fi again after a reset.
 
 Wi-Fi and MQTT settings can also be saved through the web interface.
 
