@@ -50,6 +50,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div><dt>)rawliteral" T_PLATE_ACTUAL R"rawliteral(</dt><dd id="actual">--</dd></div>
         <div><dt>)rawliteral" T_PLATE_TARGET R"rawliteral(</dt><dd id="target">--</dd></div>
         <div><dt>)rawliteral" T_PLATE_ELAPSED R"rawliteral(</dt><dd id="elapsed">--:--:--</dd></div>
+        <div><dt><label for="limit">)rawliteral" T_PLATE_LIMIT R"rawliteral(</label></dt><dd>
+          <select id="limit" disabled>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="45">45 min</option>
+            <option value="0" disabled>)rawliteral" T_PLATE_LIMIT_UNLIMITED R"rawliteral(</option>
+          </select></dd></div>
       </dl>
       <div class="row stepper">
         <button id="minus" class="btn-secondary" aria-label=")rawliteral" T_PLATE_DECREASE R"rawliteral(" disabled>&minus;</button>
@@ -61,6 +68,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <button id="stop" class="btn-secondary" disabled>)rawliteral" T_PLATE_STOP R"rawliteral(</button>
       </div>
       <div id="plateError" class="status-msg error" role="status">)rawliteral" T_PLATE_REQUEST_FAILED R"rawliteral(</div>
+      <label><input type="checkbox" id="otaOpen" disabled> )rawliteral" T_PLATE_OTA_NO_PASSWORD R"rawliteral(</label>
       <a href="/setup" class="settings-link">)rawliteral" T_PLATE_SETTINGS R"rawliteral(</a>
     </section>
   </main>
@@ -80,6 +88,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       ui.plus.disabled = busy || state.min > state.max || draft >= state.max;
       ui.apply.disabled = busy || !state.canSet || draft < state.min;
       ui.stop.disabled = busy || !state.running;
+      ui.otaOpen.disabled = busy;
+      if (!busy) ui.otaOpen.checked = state.otaOpen;
+      ui.limit.disabled = busy;
+      if (!busy && document.activeElement !== ui.limit) ui.limit.value = String(state.limit);
     }
 
     function adjust(direction) {
@@ -121,6 +133,30 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     ui.apply.onclick = () => request('/api/plate', {method: 'POST',
       headers: {'X-Reflow-Control': '1'}, body: new URLSearchParams({target: draft})});
     ui.stop.onclick = () => request('/api/plate/stop', {method: 'POST'});
+    ui.limit.onchange = () => request('/api/plate/limit', {method: 'POST',
+      headers: {'X-Reflow-Control': '1'}, body: new URLSearchParams({minutes: ui.limit.value})});
+    ui.otaOpen.onchange = async () => {
+      const open = ui.otaOpen.checked;
+      if (open && !confirm(')rawliteral" T_PLATE_OTA_CONFIRM R"rawliteral(')) {
+        ui.otaOpen.checked = false;
+        return;
+      }
+      busy = true;
+      revision += 1;
+      render();
+      try {
+        const response = await fetch('/api/ota', {method: 'POST', headers: {'X-Reflow-Control': '1'},
+          body: new URLSearchParams({open: open ? '1' : '0'})});
+        if (!response.ok) throw new Error(response.status);
+        state.otaOpen = open;
+        ui.plateError.style.display = 'none';
+      } catch {
+        ui.plateError.style.display = 'block';
+      } finally {
+        busy = false;
+        render();
+      }
+    };
     request('/api/plate');
     setInterval(() => request('/api/plate'), 1000);
   </script>
@@ -258,7 +294,6 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
       </div>
       <button id="mqttSave" class="btn-primary" onclick="saveMqtt()" disabled>)rawliteral" T_SETUP_MQTT_SAVE R"rawliteral(</button>
       <div id="mqttMsg" class="status-msg" role="status"></div>
-      <div class="status-msg info" style="display: block;">)rawliteral" T_PLATE_MQTT_PENDING R"rawliteral(</div>
     </div>
   </div>
 

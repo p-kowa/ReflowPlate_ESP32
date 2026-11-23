@@ -30,9 +30,11 @@ public:
 
     void begin(void);
     bool getTouch(uint16_t *x, uint16_t *y, uint8_t *gesture);
+    uint32_t readErrors() const { return _read_errors; }
 
 private:
     int8_t _sda, _scl, _rst, _int;
+    uint32_t _read_errors = 0;
 
     uint8_t i2c_read_continuous(uint8_t addr, uint8_t *data, uint32_t length);
     void i2c_write(uint8_t addr, uint8_t data);
