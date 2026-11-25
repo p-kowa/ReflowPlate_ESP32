@@ -56,7 +56,7 @@ struct MqttSettings {
     char base[128];
 };
 
-static WifiSettings wifi_config = {WIFI_SSID, WIFI_PASSWORD};
+static WifiSettings wifi_config = {};
 static MqttSettings mqtt_config = {"", 1883, "", "", "reflowplate"};
 
 struct MqttSnapshot {
