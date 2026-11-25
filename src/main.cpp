@@ -947,7 +947,9 @@ static void update_ota_button()
 }
 
 static bool set_ota_password_required(bool required)
-{
+{ 
+    if (OTA_PASSWORD[0] == '\0') required = false;
+    
     if (!settings_open || settings.putBool("ota_pw", required) != 1) return false;
     ota_password_required = required;
     if (ota_button) update_ota_button();
@@ -1232,11 +1234,13 @@ static void start_setup_ap()
 static void handle_ota()
 {
     static bool started = false;
-    if (OTA_PASSWORD[0] == '\0' || WiFi.status() != WL_CONNECTED) return;
+    if (WiFi.status() != WL_CONNECTED) return;
 
     if (!started) {
         ArduinoOTA.setHostname("reflowplate");
-        ArduinoOTA.setPassword(OTA_PASSWORD);
+        if (OTA_PASSWORD[0] != '\0'){
+            ArduinoOTA.setPassword(OTA_PASSWORD);
+        }
         ArduinoOTA.onStart(stop_regulation);
         ArduinoOTA.begin();
         started = true;
@@ -1391,7 +1395,7 @@ void setup() {
     if (settings_open) {
         if (settings.getBytesLength("wifi") == sizeof(wifi_config)) settings.getBytes("wifi", &wifi_config, sizeof(wifi_config));
         if (settings.getBytesLength("mqtt") == sizeof(mqtt_config)) settings.getBytes("mqtt", &mqtt_config, sizeof(mqtt_config));
-        ota_password_required = settings.getBool("ota_pw", true);
+        ota_password_required = OTA_PASSWORD[0] != '\0' && settings.getBool("ota_pw", true);
         TuneTable stored;
         if (settings.getBytesLength("tune") == sizeof(stored) &&
             settings.getBytes("tune", &stored, sizeof(stored)) == sizeof(stored) &&
